@@ -3,6 +3,8 @@ name = "logimouse"
 version = "0.2.0"
 description = "Query Logitech HID++ devices (name, firmware, battery, DPI) on a Logi Bolt receiver or connected directly"
 readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.10"
 dependencies = []
 
