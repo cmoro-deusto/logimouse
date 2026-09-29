@@ -1,0 +1,85 @@
+{
+  "settings": {
+    "show_icon": {
+      "label": "Show the mouse icon",
+      "description": "Draw a mouse glyph before the values. It turns into a warning sign when the battery is low."
+    },
+    "show_battery": {
+      "label": "Show the battery level",
+      "description": "The battery percentage, coloured by the thresholds below."
+    },
+    "show_charging": {
+      "label": "Show when charging",
+      "description": "A bolt while the mouse is charging, whether or not the percentage is shown."
+    },
+    "show_dpi": {
+      "label": "Show the DPI",
+      "description": "The mouse's current DPI."
+    },
+    "interval": {
+      "label": "Read interval (seconds)",
+      "description": "Seconds between reads from the mouse. Each read sends about 60 small requests over the wireless link."
+    },
+    "battery_warn": {
+      "label": "Battery warning level (%)",
+      "description": "At or below this percentage the battery is shown in amber."
+    },
+    "battery_low": {
+      "label": "Battery low level (%)",
+      "description": "At or below this percentage the battery is shown in the theme's error colour. If it is at or above the warning level, there is no amber band."
+    }
+  },
+  "bar": {
+    "dpi_unit": "dpi"
+  },
+  "panel": {
+    "online": "online",
+    "asleep": "asleep · last seen {ago}",
+    "unknown_device": "Unknown device",
+    "refresh": "Read now",
+    "settings": "Settings",
+    "battery": "Battery",
+    "battery_level": "level {level}",
+    "external_power": "external power",
+    "on_battery": "on battery",
+    "not_reported": "not reported",
+    "dpi": "DPI",
+    "dpi_default": "default {value}",
+    "dpi_down": "One step down",
+    "dpi_up": "One step up",
+    "dpi_asleep": "Move the mouse to wake it before changing the DPI",
+    "wheel": "Scroll wheel",
+    "smartshift": "SmartShift",
+    "threshold": "Threshold",
+    "force": "Ratchet force",
+    "resolution": "Resolution",
+    "high": "high",
+    "low": "low",
+    "direction": "Direction",
+    "inverted": "inverted",
+    "normal": "normal",
+    "ratchet": "Wheel",
+    "engaged": "ratchet engaged",
+    "free_spin": "free spin",
+    "easy_switch": "Easy-Switch",
+    "paired": "paired",
+    "empty": "empty",
+    "current": "current",
+    "buttons": "Buttons",
+    "diverted": "diverted",
+    "device": "Device",
+    "model": "Model",
+    "unit": "Unit ID",
+    "serial": "Serial",
+    "receiver": "Receiver",
+    "no_receiver": "No receiver read yet",
+    "usb_id": "USB ID",
+    "release": "Release",
+    "unique_id": "Unique ID",
+    "node": "Node",
+    "slot": "Slot {n}",
+    "slots_used": "{used} of {total} slots",
+    "no_data": "No mouse data yet",
+    "waiting": "Waiting for the first reading…"
+  }
+}

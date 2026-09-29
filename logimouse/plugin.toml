@@ -1,0 +1,93 @@
+# logimouse — a Noctalia plugin for a Logitech mouse on a Logi Bolt receiver.
+#
+# The data comes from the `logimouse` command in this same repository, which talks
+# HID++ to the receiver: Noctalia's scripts cannot open /dev/hidraw themselves.
+# service.luau runs it, shared.luau is the model, and the bar widget and the panel
+# paint what it says.
+
+id = "cmoro-deusto/logimouse"
+name = "Logi Mouse"
+version = "0.1.0"
+# The oldest API level this needs: 24 is runAsync with an argv table (service.luau).
+# The rest is older: require() 22, openSettings() 15, nowMs() 12, closures as
+# callbacks 9. Raise it only when the plugin adopts something newer.
+plugin_api = 24
+author = "cmoro-deusto"
+license = "MIT"
+dependencies = ["logimouse"]
+tags = ["bar", "panel", "hardware", "indicator"]
+icon = "mouse"
+description = "Battery, charging and DPI of a Logitech mouse on a Logi Bolt receiver, with a detail panel."
+
+[[setting]]
+key = "show_icon"
+type = "bool"
+label_key = "settings.show_icon.label"
+description_key = "settings.show_icon.description"
+default = true
+
+[[setting]]
+key = "show_battery"
+type = "bool"
+label_key = "settings.show_battery.label"
+description_key = "settings.show_battery.description"
+default = true
+
+[[setting]]
+key = "show_charging"
+type = "bool"
+label_key = "settings.show_charging.label"
+description_key = "settings.show_charging.description"
+default = true
+
+[[setting]]
+key = "show_dpi"
+type = "bool"
+label_key = "settings.show_dpi.label"
+description_key = "settings.show_dpi.description"
+default = true
+
+[[setting]]
+key = "interval"
+type = "int"
+label_key = "settings.interval.label"
+description_key = "settings.interval.description"
+default = 60
+min = 10
+max = 600
+
+[[setting]]
+key = "battery_warn"
+type = "int"
+label_key = "settings.battery_warn.label"
+description_key = "settings.battery_warn.description"
+default = 20
+min = 10
+max = 80
+
+[[setting]]
+key = "battery_low"
+type = "int"
+label_key = "settings.battery_low.label"
+description_key = "settings.battery_low.description"
+default = 10
+min = 5
+max = 50
+
+# Runs `logimouse`, one process at a time, and publishes what it read.
+[[service]]
+id = "reader"
+entry = "service.luau"
+
+[[widget]]
+id = "bar"
+entry = "bar.luau"
+
+[[panel]]
+id = "panel"
+entry = "panel.luau"
+width = 780
+height = 720
+placement = "attached"
+position = "auto"
+open_near_click = true

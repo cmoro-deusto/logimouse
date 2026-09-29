@@ -1,0 +1,6 @@
+.venv/
+__pycache__/
+.pytest_cache/
+# Noctalia API definitions for luau-lsp; fetch with:
+# curl -O https://raw.githubusercontent.com/noctalia-dev/official-plugins/main/noctalia.d.luau
+noctalia.d.luau
