@@ -1,22 +1,46 @@
 """Query a Logi Bolt receiver and its paired HID++ 2.0 devices through /dev/hidraw."""
 
 import argparse
+import contextlib
+import fcntl
 import glob
+import itertools
 import json
 import os
+import re
 import select
 import sys
+import time
 
 SHORT_REPORT = 0x10
 LONG_REPORT = 0x11
 SHORT_LEN = 7
 LONG_LEN = 20
 SOFTWARE_ID = 0x0A
+# HID++ 2.0 replies echo only the feature index, function and software ID. Every
+# feature lookup is the same request (index 0, function 0) whatever feature it asks
+# for, so a reply that arrives after its request timed out would answer the next
+# lookup with the wrong index. Each request therefore takes the next software ID in
+# turn, and a late reply carries an old one. 0 is reserved for notifications and 1 is
+# the kernel's.
+SOFTWARE_IDS = range(2, 16)
 ERROR_HIDPP10 = 0x8F
 ERROR_HIDPP20 = 0xFF
 RECEIVER_INDEX = 0xFF
+# A device connected directly (USB cable, or its own receiver handled by the kernel)
+# answers HID++ 2.0 at index 0xFF, the index a receiver itself uses.
+DIRECT_INDEX = 0xFF
 MAX_SLOTS = 6
-TIMEOUT_S = 1.0
+TIMEOUT_S = 2.0
+# The first request to an idle wireless device wakes its radio: measured at 0.7-1.0 s
+# for an MX Anywhere 3S on a Bolt receiver, against about 20 ms once it is awake. The
+# ping that opens every exchange with a device gets this much longer.
+WAKE_TIMEOUT_S = 2.5
+# A receiver answers "busy" while it is still handling another request (another
+# process's, for instance); such a request is retried after a short pause.
+ERROR_BUSY = 0x07
+BUSY_RETRIES = 5
+BUSY_DELAY_S = 0.05
 
 FEATURE_FEATURE_SET = 0x0001
 FEATURE_FW_VERSION = 0x0003
@@ -31,14 +55,25 @@ FEATURE_WIRELESS_STATUS = 0x1D4B
 FEATURE_SMART_SHIFT = 0x2111
 FEATURE_HIRES_WHEEL = 0x2121
 FEATURE_ADJUSTABLE_DPI = 0x2201
+FEATURE_REPORT_RATE = 0x8060
+FEATURE_ONBOARD_PROFILES = 0x8100
+PROFILE_MODES = {1: "onboard", 2: "host"}
 
 REGISTER_GET_SHORT = 0x81
 REGISTER_GET_LONG = 0x83
 REGISTER_CONNECTIONS = 0x02
 REGISTER_RECEIVER_INFO = 0xB5
 REGISTER_UNIQUE_ID = 0xFB
+# Bolt keeps pairing data in sub-registers 0x50+slot and 0x60+slot; Unifying and
+# Lightspeed receivers in 0x20/0x30/0x40 + slot - 1, and their own serial and slot
+# count in 0x03.
 INFO_PAIRING = 0x50
 INFO_NAME = 0x60
+INFO_RECEIVER = 0x03
+INFO_PAIRING_LEGACY = 0x20
+INFO_EXTENDED_LEGACY = 0x30
+INFO_NAME_LEGACY = 0x40
+BOLT_PRODUCT = "c548"
 
 FW_TYPES = {0: "main", 1: "bootloader", 2: "hardware", 3: "touchpad", 4: "optical sensor", 5: "softdevice"}
 BATTERY_LEVELS = {1: "critical", 2: "low", 4: "good", 8: "full"}
@@ -49,6 +84,12 @@ DEVICE_TYPES = {
     12: "gamepad", 13: "dock", 14: "speaker", 15: "microphone",
 }
 PAIRED_KINDS = {1: "keyboard", 2: "mouse", 3: "numpad"}
+# Receiver names by USB product id. The pairing registers read below are the Bolt
+# ones; other receivers are listed, but their slots may come back empty.
+RECEIVER_NAMES = {
+    "c548": "Logi Bolt", "c52b": "Unifying", "c534": "Nano", "c539": "Lightspeed",
+    "c53a": "Lightspeed", "c53f": "Lightspeed", "c545": "Lightspeed", "c547": "Lightspeed",
+}
 SMART_SHIFT_MODES = {1: "free spin", 2: "ratchet"}
 CONTROL_NAMES = {
     0x0050: "Left click", 0x0051: "Right click", 0x0052: "Middle click", 0x0053: "Back",
@@ -65,24 +106,43 @@ class Hidraw:
 
     def __init__(self, fd: int):
         self.fd = fd
+        self._software_ids = itertools.cycle(SOFTWARE_IDS)
 
-    def request(self, report_id: int, index: int, sub_id: int, address: int, *params: int) -> bytes | None:
+    def next_software_id(self) -> int:
+        return next(self._software_ids)
+
+    def drain(self) -> None:
+        """Discard what is already waiting, such as a reply that arrived after its request timed out."""
+        while select.select([self.fd], [], [], 0)[0]:
+            os.read(self.fd, 64)
+
+    def request(self, report_id: int, index: int, sub_id: int, address: int, *params: int, timeout: float = TIMEOUT_S) -> bytes | None:
         """Return the reply payload (bytes after the address byte), or None on error or timeout."""
+        for attempt in range(BUSY_RETRIES):
+            busy, reply = self._exchange(report_id, index, sub_id, address, *params, timeout=timeout)
+            if not busy:
+                return reply
+            time.sleep(BUSY_DELAY_S * (attempt + 1))
+        return None
+
+    def _exchange(self, report_id: int, index: int, sub_id: int, address: int, *params: int, timeout: float = TIMEOUT_S) -> tuple[bool, bytes | None]:
+        """Send one request; return (busy, payload). An error reply only counts when it
+        echoes this request's sub ID and address, which carries the software ID: an
+        error meant for another process is not ours."""
         length = SHORT_LEN if report_id == SHORT_REPORT else LONG_LEN
+        self.drain()
         os.write(self.fd, bytes([report_id, index, sub_id, address, *params]).ljust(length, b"\0"))
         while True:
-            ready, _, _ = select.select([self.fd], [], [], TIMEOUT_S)
+            ready, _, _ = select.select([self.fd], [], [], timeout)
             if not ready:
-                return None
+                return False, None
             reply = os.read(self.fd, 64)
-            if len(reply) < 5 or reply[1] != index:
+            if len(reply) < 6 or reply[1] != index:
                 continue
-            if reply[2] == ERROR_HIDPP10 and reply[3] == sub_id:
-                return None
-            if reply[2] == ERROR_HIDPP20 and reply[3] == sub_id:
-                return None
+            if reply[2] in (ERROR_HIDPP10, ERROR_HIDPP20) and reply[3] == sub_id and reply[4] == address:
+                return reply[2] == ERROR_HIDPP10 and reply[5] == ERROR_BUSY, None
             if reply[2] == sub_id and reply[3] == address:
-                return reply[4:]
+                return False, reply[4:]
 
 
 class Device:
@@ -93,8 +153,9 @@ class Device:
         self.index = index
         self._features: dict[int, int | None] = {}
 
-    def call(self, feature_index: int, function: int, *params: int) -> bytes | None:
-        return self.hidraw.request(LONG_REPORT, self.index, feature_index, (function << 4) | SOFTWARE_ID, *params)
+    def call(self, feature_index: int, function: int, *params: int, timeout: float = TIMEOUT_S) -> bytes | None:
+        address = (function << 4) | self.hidraw.next_software_id()
+        return self.hidraw.request(LONG_REPORT, self.index, feature_index, address, *params, timeout=timeout)
 
     def feature(self, feature_id: int) -> int | None:
         if feature_id not in self._features:
@@ -107,7 +168,7 @@ class Device:
         return None if idx is None else self.call(idx, function, *params)
 
     def is_online(self) -> bool:
-        return self.call(0, 1) is not None
+        return self.call(0, 1, timeout=WAKE_TIMEOUT_S) is not None
 
     def name(self) -> str | None:
         reply = self.call_feature(FEATURE_NAME, 0)
@@ -140,8 +201,9 @@ class Device:
         info = {"modelId": reply[7:13].hex().upper(), "unitId": reply[1:5].hex().upper(), "serial": None, "firmware": []}
         if reply[14] & 0x01:
             serial = self.call_feature(FEATURE_FW_VERSION, 2)
-            if serial:
-                info["serial"] = serial[:12].decode(errors="replace")
+            # Some devices claim a serial and answer with zero bytes: that is no serial.
+            text = serial[:12].rstrip(b"\0").decode(errors="replace").strip() if serial else ""
+            info["serial"] = text or None
         for entity in range(reply[0]):
             fw = self.call_feature(FEATURE_FW_VERSION, 1, entity)
             prefix = fw[1:4].decode(errors="replace").strip("\0 ")
@@ -235,6 +297,30 @@ class Device:
             "values": None if step else values,
         }
 
+    def report_rate(self) -> dict | None:
+        """The polling rate in Hz: 0x8060 reports it as an interval, bit n of the
+        supported mask meaning n + 1 ms."""
+        supported = self.call_feature(FEATURE_REPORT_RATE, 0)
+        current = self.call_feature(FEATURE_REPORT_RATE, 1)
+        if supported is None or current is None or current[0] == 0:
+            return None
+        rates = sorted(1000 // (bit + 1) for bit in range(8) if supported[0] & (1 << bit))
+        return {"current": 1000 // current[0], "supported": rates}
+
+    def set_report_rate(self, hz: int) -> bool:
+        return self.call_feature(FEATURE_REPORT_RATE, 2, 1000 // hz) is not None
+
+    def profile_mode(self) -> str | None:
+        """"onboard" when the profile stored on the mouse sets its report rate, DPI
+        levels, buttons and lighting; "host" when the computer does. None without
+        onboard profiles."""
+        reply = self.call_feature(FEATURE_ONBOARD_PROFILES, 2)
+        return None if reply is None else PROFILE_MODES.get(reply[0], f"mode {reply[0]}")
+
+    def set_profile_mode(self, mode: str) -> bool:
+        value = next(key for key, name in PROFILE_MODES.items() if name == mode)
+        return self.call_feature(FEATURE_ONBOARD_PROFILES, 1, value) is not None
+
     def smart_shift(self) -> dict | None:
         reply = self.call_feature(FEATURE_SMART_SHIFT, 1)
         if reply is None:
@@ -285,10 +371,14 @@ class Device:
             })
         return controls
 
+    def unit_id(self) -> str | None:
+        reply = self.call_feature(FEATURE_FW_VERSION, 0)
+        return None if reply is None else reply[1:5].hex().upper()
+
     def to_dict(self) -> dict:
         info = self.device_info() or {}
         return {
-            "slot": self.index,
+            "slot": None if self.index == DIRECT_INDEX else self.index,
             "name": self.name(),
             "type": self.device_type(),
             "friendlyName": self.friendly_name(),
@@ -299,6 +389,8 @@ class Device:
             "battery": self.battery(),
             "wirelessStatus": self.has_wireless_status(),
             "dpi": self.dpi(),
+            "reportRate": self.report_rate(),
+            "profileMode": self.profile_mode(),
             "smartShift": self.smart_shift(),
             "wheel": self.wheel(),
             "hosts": self.hosts(),
@@ -306,12 +398,33 @@ class Device:
         }
 
 
-class Receiver:
-    """The Bolt receiver itself, queried through HID++ 1.0 registers."""
+def usb_info(path: str) -> dict[str, str]:
+    """USB descriptor strings of the device a hidraw node belongs to, read from sysfs."""
+    usb_dir = os.path.realpath(f"/sys/class/hidraw/{os.path.basename(path)}/device/../..")
+    info = {}
+    for attr in ("idVendor", "idProduct", "manufacturer", "product", "bcdDevice"):
+        try:
+            with open(f"{usb_dir}/{attr}") as f:
+                info[attr] = f.read().strip()
+        except OSError:
+            pass
+    return info
 
-    def __init__(self, hidraw: Hidraw, path: str):
+
+def usb_id(usb: dict[str, str]) -> str | None:
+    if "idVendor" in usb and "idProduct" in usb:
+        return f"{usb['idVendor']}:{usb['idProduct']}"
+    return None
+
+
+class Receiver:
+    """A receiver, queried through HID++ 1.0 registers."""
+
+    def __init__(self, hidraw: Hidraw, path: str, usb: dict[str, str] | None = None):
         self.hidraw = hidraw
         self.path = path
+        self.usb = usb if usb is not None else usb_info(path)
+        self._slots: list[dict] | None = None
 
     def read_short(self, register: int, *params: int) -> bytes | None:
         return self.hidraw.request(SHORT_REPORT, RECEIVER_INDEX, REGISTER_GET_SHORT, register, *params)
@@ -319,26 +432,40 @@ class Receiver:
     def read_long(self, register: int, *params: int) -> bytes | None:
         return self.hidraw.request(SHORT_REPORT, RECEIVER_INDEX, REGISTER_GET_LONG, register, *params)
 
-    def usb_info(self) -> dict[str, str]:
-        usb_dir = os.path.realpath(f"/sys/class/hidraw/{os.path.basename(self.path)}/device/../..")
-        info = {}
-        for attr in ("idVendor", "idProduct", "manufacturer", "product", "bcdDevice"):
-            try:
-                with open(f"{usb_dir}/{attr}") as f:
-                    info[attr] = f.read().strip()
-            except OSError:
-                pass
-        return info
+    def is_receiver(self) -> bool:
+        """A receiver answers the connections register; a device on its own does not."""
+        return self.paired_count() is not None
+
+    def name(self) -> str:
+        return RECEIVER_NAMES.get(self.usb.get("idProduct", "").lower(), "Logitech") + " receiver"
+
+    def is_bolt(self) -> bool:
+        return self.usb.get("idProduct", "").lower() == BOLT_PRODUCT
 
     def unique_id(self) -> str | None:
-        reply = self.read_long(REGISTER_UNIQUE_ID)
-        return None if reply is None else reply.rstrip(b"\0").decode(errors="replace")
+        if self.is_bolt():
+            reply = self.read_long(REGISTER_UNIQUE_ID)
+            return None if reply is None else reply.rstrip(b"\0").decode(errors="replace")
+        reply = self.read_long(REGISTER_RECEIVER_INFO, INFO_RECEIVER)
+        return None if reply is None else reply[1:5].hex().upper()
+
+    def max_slots(self) -> int:
+        if not self.is_bolt():
+            reply = self.read_long(REGISTER_RECEIVER_INFO, INFO_RECEIVER)
+            if reply is not None and 1 <= reply[6] <= MAX_SLOTS:
+                return reply[6]
+        return MAX_SLOTS
 
     def paired_count(self) -> int | None:
         reply = self.read_short(REGISTER_CONNECTIONS)
         return None if reply is None else reply[1]
 
     def slot(self, n: int) -> dict | None:
+        if self.is_bolt():
+            return self._bolt_slot(n)
+        return self._legacy_slot(n)
+
+    def _bolt_slot(self, n: int) -> dict | None:
         pairing = self.read_long(REGISTER_RECEIVER_INFO, INFO_PAIRING + n)
         if pairing is None:
             return None
@@ -354,51 +481,169 @@ class Receiver:
             slot["name"] = name[3:3 + name[2]].decode(errors="replace")
         return slot
 
+    def _legacy_slot(self, n: int) -> dict | None:
+        pairing = self.read_long(REGISTER_RECEIVER_INFO, INFO_PAIRING_LEGACY + n - 1)
+        if pairing is None:
+            return None
+        slot = {
+            "slot": n,
+            "name": None,
+            "kind": PAIRED_KINDS.get(pairing[7] & 0x0F, f"kind {pairing[7] & 0x0F}"),
+            "wpid": pairing[3:5].hex().upper(),
+            "unitId": None,
+        }
+        extended = self.read_long(REGISTER_RECEIVER_INFO, INFO_EXTENDED_LEGACY + n - 1)
+        if extended is not None:
+            slot["unitId"] = extended[1:5].hex().upper()
+        name = self.read_long(REGISTER_RECEIVER_INFO, INFO_NAME_LEGACY + n - 1)
+        if name is not None:
+            slot["name"] = name[2:2 + name[1]].decode(errors="replace")
+        return slot
+
+    def slots(self) -> list[dict]:
+        if self._slots is None:
+            self._slots = [slot for slot in (self.slot(n) for n in range(1, self.max_slots() + 1)) if slot is not None]
+        return self._slots
+
+    def devices(self) -> list[Device]:
+        """The online devices: only the paired slots are pinged, since an empty slot on
+        some receivers answers nothing and costs a timeout. With no pairing data, all."""
+        indexes = [slot["slot"] for slot in self.slots()] or range(1, self.max_slots() + 1)
+        return [device for device in (Device(self.hidraw, i) for i in indexes) if device.is_online()]
+
     def to_dict(self, online_slots: set[int]) -> dict:
-        usb = self.usb_info()
-        release = usb.get("bcdDevice")
-        slots = []
-        for n in range(1, MAX_SLOTS + 1):
-            slot = self.slot(n)
-            if slot is not None:
-                slot["online"] = n in online_slots
-                slots.append(slot)
+        release = self.usb.get("bcdDevice")
+        slots = [{**slot, "online": slot["slot"] in online_slots} for slot in self.slots()]
         return {
             "path": self.path,
-            "usbId": f"{usb['idVendor']}:{usb['idProduct']}" if "idVendor" in usb and "idProduct" in usb else None,
-            "product": f"{usb.get('manufacturer', '')} {usb['product']}".strip() if "product" in usb else None,
+            "name": self.name(),
+            "usbId": usb_id(self.usb),
+            "product": f"{self.usb.get('manufacturer', '')} {self.usb['product']}".strip() if "product" in self.usb else None,
             "release": f"{release[:2]}.{release[2:]}" if release else None,
             "uniqueId": self.unique_id(),
             "pairedCount": self.paired_count(),
-            "maxSlots": MAX_SLOTS,
+            "maxSlots": self.max_slots(),
             "slots": slots,
         }
 
 
-def find_hidpp_node() -> str | None:
-    """Return the hidraw node of the Logitech receiver interface that carries HID++ long reports."""
-    for path in sorted(glob.glob("/sys/class/hidraw/hidraw*")):
-        with open(f"{path}/device/uevent") as f:
-            uevent = f.read()
-        if "0000046D" not in uevent.upper():
+# ── Discovery ───────────────────────────────────────────────────────────────
+
+def hidraw_number(path: str) -> int:
+    digits = "".join(ch for ch in os.path.basename(path) if ch.isdigit())
+    return int(digits) if digits else 0
+
+
+HID_DEVICE_NAME = re.compile(r"^[0-9A-F]{4}:[0-9A-F]{4}:[0-9A-F]{4}\.[0-9A-F]{4}$", re.IGNORECASE)
+
+
+def is_receiver_child(sys_path: str) -> bool:
+    """True for a node the kernel's Logitech receiver driver creates per paired device.
+
+    Its HID device sits under the receiver's HID device instead of a USB interface.
+    The device is already reached through the receiver, and requests on this node
+    get their device index rewritten, so reading it would duplicate the device and
+    time out.
+    """
+    parent = os.path.basename(os.path.realpath(f"{sys_path}/device/.."))
+    return bool(HID_DEVICE_NAME.match(parent))
+
+
+def find_hidpp_nodes() -> list[dict]:
+    """Every Logitech hidraw node that carries HID++ long reports, in numeric order.
+
+    Reading sysfs needs no access to the node itself, so this also finds the nodes
+    the user cannot open.
+    """
+    nodes = []
+    for path in glob.glob("/sys/class/hidraw/hidraw*"):
+        try:
+            with open(f"{path}/device/uevent") as f:
+                uevent = f.read()
+            with open(f"{path}/device/report_descriptor", "rb") as f:
+                descriptor = f.read()
+        except OSError:
             continue
-        with open(f"{path}/device/report_descriptor", "rb") as f:
-            if b"\x85\x11" in f.read():
-                return "/dev/" + os.path.basename(path)
-    return None
+        if "0000046D" not in uevent.upper() or b"\x85\x11" not in descriptor:
+            continue
+        if is_receiver_child(path):
+            continue
+        name = next((line.split("=", 1)[1] for line in uevent.splitlines() if line.startswith("HID_NAME=")), None)
+        nodes.append({"path": "/dev/" + os.path.basename(path), "name": name})
+    return sorted(nodes, key=lambda node: hidraw_number(node["path"]))
 
 
-def online_devices(hidraw: Hidraw) -> list[Device]:
-    return [device for device in (Device(hidraw, i) for i in range(1, MAX_SLOTS + 1)) if device.is_online()]
+def open_node(path: str) -> int:
+    return os.open(path, os.O_RDWR)
 
 
-def build_report(hidraw: Hidraw, path: str) -> dict:
-    devices = online_devices(hidraw)
+
+class Scan:
+    """Every reachable HID++ device: those on receivers, those connected directly, and
+    the nodes that could not be opened. Holds the nodes open until closed."""
+
+    def __init__(self, nodes: list[dict], opener=open_node, usb_reader=usb_info, hidraw_factory=Hidraw):
+        self.fds: list[int] = []
+        self.receivers: list[Receiver] = []
+        self.devices: list[tuple[Device, dict]] = []
+        self.inaccessible: list[dict] = []
+        for node in nodes:
+            path = node["path"]
+            usb = usb_reader(path)
+            try:
+                fd = opener(path)
+            except PermissionError:
+                self.inaccessible.append({"path": path, "name": node.get("name"), "usbId": usb_id(usb), "reason": "permission denied"})
+                continue
+            except OSError as error:
+                self.inaccessible.append({"path": path, "name": node.get("name"), "usbId": usb_id(usb), "reason": error.strerror or str(error)})
+                continue
+            self.fds.append(fd)
+            hidraw = hidraw_factory(fd)
+            receiver = Receiver(hidraw, path, usb)
+            if receiver.is_receiver():
+                self.receivers.append(receiver)
+                for device in receiver.devices():
+                    self.devices.append((device, {"type": "receiver", "receiver": path, "receiverName": receiver.name(), "slot": device.index}))
+                continue
+            device = Device(hidraw, DIRECT_INDEX)
+            if device.is_online():
+                self.devices.append((device, {"type": "direct", "path": path, "usbId": usb_id(usb), "product": usb.get("product")}))
+
+    def close(self) -> None:
+        for fd in self.fds:
+            if isinstance(fd, int) and fd >= 0:
+                os.close(fd)
+        self.fds = []
+
+    def __enter__(self) -> "Scan":
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
+
+def build_report(scan: Scan) -> dict:
+    devices = []
+    online_by_receiver: dict[str, set[int]] = {}
+    seen: set[str] = set()
+    for device, connection in scan.devices:
+        info = device.to_dict()
+        # The same device can be reachable twice (a receiver and a cable at once); list it once.
+        if info["unitId"] is not None and info["unitId"] in seen:
+            continue
+        if info["unitId"] is not None:
+            seen.add(info["unitId"])
+        info["connection"] = connection
+        devices.append(info)
+        if connection["type"] == "receiver":
+            online_by_receiver.setdefault(connection["receiver"], set()).add(connection["slot"])
     return {
         "ok": True,
         "error": None,
-        "devices": [device.to_dict() for device in devices],
-        "receiver": Receiver(hidraw, path).to_dict({device.index for device in devices}),
+        "devices": devices,
+        "receivers": [receiver.to_dict(online_by_receiver.get(receiver.path, set())) for receiver in scan.receivers],
+        "inaccessible": scan.inaccessible,
     }
 
 
@@ -433,6 +678,20 @@ def format_dpi(dpi: dict | None) -> str | None:
     else:
         supported = ", ".join(str(v) for v in dpi["values"])
     return f"{dpi['current']} (default {dpi['default']}; supported {supported})"
+
+
+def format_report_rate(rate: dict | None) -> str | None:
+    if rate is None:
+        return None
+    return f"{rate['current']} Hz (supported {', '.join(str(hz) for hz in rate['supported'])} Hz)"
+
+
+def format_profile_mode(mode: str | None) -> str | None:
+    if mode == "onboard":
+        return "onboard (the mouse's stored profile sets report rate, DPI levels, buttons and lighting)"
+    if mode == "host":
+        return "host (the onboard profile is off; settings come from this computer)"
+    return mode
 
 
 def format_smart_shift(smart_shift: dict | None) -> str | None:
@@ -478,8 +737,15 @@ def format_buttons(buttons: list[dict] | None) -> list[str] | None:
     return lines
 
 
+def connection_text(connection: dict) -> str:
+    if connection["type"] == "receiver":
+        return f"{connection['receiverName']}, slot {connection['slot']} ({connection['receiver']})"
+    return f"direct, USB {connection['usbId']} ({connection['path']})"
+
+
 def print_device(device: dict) -> None:
-    print(f"\nSlot {device['slot']}: {device['name'] or 'unknown'}")
+    print(f"\n{device['name'] or 'Unknown device'}")
+    field("Connection", connection_text(device["connection"]))
     field("Type", device["type"])
     field("Friendly name", device["friendlyName"])
     field("Model ID", device["modelId"])
@@ -491,6 +757,8 @@ def print_device(device: dict) -> None:
     if device["wirelessStatus"]:
         field("Wireless status", "online (reconnect events only; no current value to query)")
     field("DPI", format_dpi(device["dpi"]))
+    field("Report rate", format_report_rate(device["reportRate"]))
+    field("Profile mode", format_profile_mode(device["profileMode"]))
     field("SmartShift", format_smart_shift(device["smartShift"]))
     field("Wheel", format_wheel(device["wheel"]))
     field_list("Easy-Switch", format_hosts(device["hosts"]))
@@ -498,7 +766,7 @@ def print_device(device: dict) -> None:
 
 
 def print_receiver(receiver: dict) -> None:
-    print("\nReceiver")
+    print(f"\n{receiver['name']}")
     field("Device node", receiver["path"])
     field("USB ID", receiver["usbId"])
     field("USB product", receiver["product"])
@@ -507,24 +775,53 @@ def print_receiver(receiver: dict) -> None:
     if receiver["pairedCount"] is not None:
         field("Paired devices", f"{receiver['pairedCount']} of {receiver['maxSlots']}")
     for slot in receiver["slots"]:
-        field(f"Slot {slot['slot']}", f"{slot['name'] or 'unknown'} ({slot['kind']}, WPID {slot['wpid']}, unit ID {slot['unitId']})")
+        state = "online" if slot["online"] else "offline"
+        field(f"Slot {slot['slot']}", f"{slot['name'] or 'unknown'} ({slot['kind']}, WPID {slot['wpid']}, unit ID {slot['unitId']}, {state})")
 
 
 def print_report(report: dict) -> None:
     if not report["devices"]:
-        print("No online devices on this receiver")
+        print("No online devices")
     for device in report["devices"]:
         print_device(device)
-    print_receiver(report["receiver"])
+    for receiver in report["receivers"]:
+        print_receiver(receiver)
+    if report["inaccessible"]:
+        print("\nNot accessible (see grant-access.sh)")
+        for node in report["inaccessible"]:
+            field(node["path"], f"{node['name'] or 'unknown'} ({node['usbId'] or '?'}): {node['reason']}")
 
 
 # ── DPI command ─────────────────────────────────────────────────────────────
 
-def select_dpi_device(online: list[Device], slot: int | None) -> Device | None:
-    for device in online:
-        if (slot is None or device.index == slot) and device.feature(FEATURE_ADJUSTABLE_DPI) is not None:
+def select_device(scan: Scan, feature_id: int, unit_id: str | None, slot: int | None) -> Device | None:
+    """The device a command addresses: by unit ID, by receiver slot, or the first one
+    with the feature."""
+    for device, connection in scan.devices:
+        if device.feature(feature_id) is None:
+            continue
+        if unit_id is not None:
+            if (device.unit_id() or "").upper() == unit_id.upper():
+                return device
+        elif slot is not None:
+            if connection["type"] == "receiver" and connection["slot"] == slot:
+                return device
+        else:
             return device
     return None
+
+
+def require_device(scan: Scan, feature_id: int, what: str, unit_id: str | None, slot: int | None) -> Device:
+    device = select_device(scan, feature_id, unit_id, slot)
+    if device is None:
+        if unit_id is not None:
+            where = f"with unit ID {unit_id}"
+        elif slot is not None:
+            where = f"in receiver slot {slot}"
+        else:
+            where = "connected"
+        raise LogimouseError(f"No online device with {what} {where}")
+    return device
 
 
 def dpi_target(action: str, current: int, values: list[int]) -> int:
@@ -544,21 +841,85 @@ def dpi_target(action: str, current: int, values: list[int]) -> int:
     raise LogimouseError(f"Invalid DPI action '{action}': use up, down or a number")
 
 
-def run_dpi(hidraw: Hidraw, slot: int | None, action: str | None) -> dict:
-    """Show or change the DPI; return {"slot", "previous", "current", "changed"}."""
-    device = select_dpi_device(online_devices(hidraw), slot)
-    if device is None:
-        where = f"in slot {slot}" if slot is not None else "on this receiver"
-        raise LogimouseError(f"No online device with adjustable DPI {where}")
+def run_dpi(scan: Scan, unit_id: str | None, slot: int | None, action: str | None) -> dict:
+    """Show or change the DPI; return {"unitId", "previous", "current", "changed", "dpi"}."""
+    device = require_device(scan, FEATURE_ADJUSTABLE_DPI, "adjustable DPI", unit_id, slot)
     current, _ = device.current_dpi()
+    selected = device.unit_id()
     if action is None:
-        return {"slot": device.index, "previous": current, "current": current, "changed": False, "dpi": device.dpi()}
+        return {"unitId": selected, "previous": current, "current": current, "changed": False, "dpi": device.dpi()}
     values, _ = device.dpi_values()
     target = dpi_target(action, current, values)
     if target != current and not device.set_dpi(target):
         raise LogimouseError(f"Failed to set DPI to {target}")
     now = device.current_dpi()[0] if target != current else current
-    return {"slot": device.index, "previous": current, "current": now, "changed": now != current, "dpi": None}
+    return {"unitId": selected, "previous": current, "current": now, "changed": now != current, "dpi": None}
+
+
+def rate_target(action: str, current: int, rates: list[int]) -> int:
+    """The report rate in Hz an action asks for; "up" is the next higher rate."""
+    if action == "up":
+        higher = [hz for hz in rates if hz > current]
+        return higher[0] if higher else current
+    if action == "down":
+        lower = [hz for hz in rates if hz < current]
+        return lower[-1] if lower else current
+    if action.isdigit() and int(action) in rates:
+        return int(action)
+    supported = ", ".join(str(hz) for hz in rates)
+    raise LogimouseError(f"Invalid report rate '{action}': use up, down or one of {supported} (Hz)")
+
+
+def run_rate(scan: Scan, unit_id: str | None, slot: int | None, action: str | None) -> dict:
+    """Show or change the report rate; return {"unitId", "previous", "current", "changed", "reportRate", "profileMode"}."""
+    device = require_device(scan, FEATURE_REPORT_RATE, "an adjustable report rate", unit_id, slot)
+    rate = device.report_rate()
+    mode = device.profile_mode()
+    result = {"unitId": device.unit_id(), "previous": rate["current"], "current": rate["current"],
+              "changed": False, "reportRate": rate, "profileMode": mode}
+    if action is None:
+        return result
+    target = rate_target(action, rate["current"], rate["supported"])
+    if target == rate["current"]:
+        return result
+    if mode == "onboard":
+        raise LogimouseError("The report rate is set by the onboard profile: switch to host mode first (logimouse mode host)")
+    if not device.set_report_rate(target):
+        raise LogimouseError(f"The device refused a report rate of {target} Hz")
+    now = device.report_rate()["current"]
+    return {**result, "current": now, "changed": now != rate["current"], "reportRate": None}
+
+
+def run_mode(scan: Scan, unit_id: str | None, slot: int | None, action: str | None) -> dict:
+    """Show or change the onboard-profile mode; return {"unitId", "previous", "current", "changed"}."""
+    device = require_device(scan, FEATURE_ONBOARD_PROFILES, "onboard profiles", unit_id, slot)
+    mode = device.profile_mode()
+    result = {"unitId": device.unit_id(), "previous": mode, "current": mode, "changed": False}
+    if action is None or action == mode:
+        return result
+    if action not in PROFILE_MODES.values():
+        raise LogimouseError(f"Invalid mode '{action}': use onboard or host")
+    if not device.set_profile_mode(action):
+        raise LogimouseError(f"The device refused to switch to {action} mode")
+    now = device.profile_mode()
+    return {**result, "current": now, "changed": now != mode}
+
+
+def print_rate_result(result: dict, action: str | None) -> None:
+    if action is None:
+        print(format_report_rate(result["reportRate"]))
+        print(f"Profile mode: {format_profile_mode(result['profileMode']) or 'none'}")
+    elif not result["changed"]:
+        print(f"Report rate: {result['current']} Hz (unchanged)")
+    else:
+        print(f"Report rate: {result['previous']} Hz -> {result['current']} Hz")
+
+
+def print_mode_result(result: dict, action: str | None) -> None:
+    if action is None or not result["changed"]:
+        print(f"Profile mode: {format_profile_mode(result['current'])}")
+    else:
+        print(f"Profile mode: {result['previous']} -> {result['current']}")
 
 
 def print_dpi_result(result: dict, action: str | None) -> None:
@@ -574,37 +935,71 @@ def print_dpi_result(result: dict, action: str | None) -> None:
 # ── Entry point ─────────────────────────────────────────────────────────────
 
 def parse_args(argv: list[str] | None) -> argparse.Namespace:
-    parser = argparse.ArgumentParser(prog="logimouse", description="Query Logitech devices on a Logi Bolt receiver.")
-    parser.add_argument("--slot", type=int, choices=range(1, MAX_SLOTS + 1), help="receiver slot of the device to change")
+    parser = argparse.ArgumentParser(prog="logimouse", description="Query Logitech HID++ devices on receivers or connected directly.")
+    target = parser.add_mutually_exclusive_group()
+    target.add_argument("--device", metavar="UNIT_ID", help="unit ID of the device to change (see the report)")
+    target.add_argument("--slot", type=int, choices=range(1, MAX_SLOTS + 1), help="receiver slot of the device to change")
     parser.add_argument("--json", action="store_true", help="print the result as JSON")
     commands = parser.add_subparsers(dest="command")
     dpi = commands.add_parser("dpi", help="show or change the DPI")
     dpi.add_argument("action", nargs="?", help="'up', 'down' or a DPI value; omit to show the current DPI")
+    rate = commands.add_parser("rate", help="show or change the report rate (needs host mode on mice with onboard profiles)")
+    rate.add_argument("action", nargs="?", help="'up', 'down' or a rate in Hz; omit to show the current rate")
+    mode = commands.add_parser("mode", help="show or change the onboard-profile mode")
+    mode.add_argument("action", nargs="?", choices=["onboard", "host"], help="omit to show the current mode")
     return parser.parse_args(argv)
 
 
-def open_receiver() -> tuple[int, str]:
-    path = find_hidpp_node()
-    if path is None:
-        raise LogimouseError("No Logitech HID++ receiver found")
-    try:
-        return os.open(path, os.O_RDWR), path
-    except PermissionError:
-        raise LogimouseError(f"Permission denied on {path}") from None
+LOCK_TIMEOUT_S = 60
+
+
+def lock_path() -> str:
+    runtime = os.environ.get("XDG_RUNTIME_DIR")
+    return os.path.join(runtime, "logimouse.lock") if runtime else f"/tmp/logimouse-{os.getuid()}.lock"
+
+
+@contextlib.contextmanager
+def exclusive_access():
+    """Only one logimouse talks to the devices at a time.
+
+    Receivers answer one request at a time, and HID++ replies carry too little to
+    tell whose request they answer, so two concurrent runs corrupt each other's reads
+    (a device read with another request's replies). A second run waits here instead.
+    """
+    with open(lock_path(), "a") as lock:
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() > deadline:
+                    raise LogimouseError("Another logimouse has been busy for over a minute") from None
+                time.sleep(0.05)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock, fcntl.LOCK_UN)
+
+
+def run(args: argparse.Namespace) -> dict:
+    nodes = find_hidpp_nodes()
+    if not nodes:
+        raise LogimouseError("No Logitech HID++ device found")
+    with exclusive_access(), Scan(nodes) as scan:
+        commands = {"dpi": run_dpi, "rate": run_rate, "mode": run_mode}
+        if args.command in commands:
+            if not scan.devices and scan.inaccessible:
+                paths = ", ".join(node["path"] for node in scan.inaccessible)
+                raise LogimouseError(f"No accessible device (no access to {paths})")
+            return commands[args.command](scan, args.device, args.slot, args.action)
+        return build_report(scan)
 
 
 def main(argv: list[str] | None = None) -> int:
     args = parse_args(argv)
     try:
-        fd, path = open_receiver()
-        try:
-            hidraw = Hidraw(fd)
-            if args.command == "dpi":
-                result = run_dpi(hidraw, args.slot, args.action)
-            else:
-                result = build_report(hidraw, path)
-        finally:
-            os.close(fd)
+        result = run(args)
     except LogimouseError as error:
         if args.json:
             print(json.dumps({"ok": False, "error": str(error)}))
@@ -613,9 +1008,13 @@ def main(argv: list[str] | None = None) -> int:
         return 1
 
     if args.json:
-        print(json.dumps({"ok": True, "error": None, **result} if args.command == "dpi" else result))
+        print(json.dumps(result if args.command is None else {"ok": True, "error": None, **result}))
     elif args.command == "dpi":
         print_dpi_result(result, args.action)
+    elif args.command == "rate":
+        print_rate_result(result, args.action)
+    elif args.command == "mode":
+        print_mode_result(result, args.action)
     else:
         print_report(result)
     return 0

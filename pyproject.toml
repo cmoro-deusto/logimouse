@@ -1,7 +1,7 @@
 [project]
 name = "logimouse"
-version = "0.1.0"
-description = "Query Logitech HID++ devices (name, firmware, battery) through a Logi Bolt receiver"
+version = "0.2.0"
+description = "Query Logitech HID++ devices (name, firmware, battery, DPI) on a Logi Bolt receiver or connected directly"
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = []

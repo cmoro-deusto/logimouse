@@ -1,4 +1,5 @@
-# logimouse — a Noctalia plugin for a Logitech mouse on a Logi Bolt receiver.
+# logimouse — a Noctalia plugin for Logitech mice, on a Logi Bolt receiver or
+# connected directly.
 #
 # The data comes from the `logimouse` command in this same repository, which talks
 # HID++ to the receiver: Noctalia's scripts cannot open /dev/hidraw themselves.
@@ -7,7 +8,7 @@
 
 id = "cmoro-deusto/logimouse"
 name = "Logi Mouse"
-version = "0.1.0"
+version = "0.2.0"
 # The oldest API level this needs: 24 is runAsync with an argv table (service.luau).
 # The rest is older: require() 22, openSettings() 15, nowMs() 12, closures as
 # callbacks 9. Raise it only when the plugin adopts something newer.
@@ -17,7 +18,7 @@ license = "MIT"
 dependencies = ["logimouse"]
 tags = ["bar", "panel", "hardware", "indicator"]
 icon = "mouse"
-description = "Battery, charging and DPI of a Logitech mouse on a Logi Bolt receiver, with a detail panel."
+description = "Battery, charging and DPI of Logitech mice, on a Bolt receiver or plugged in, with a detail panel."
 
 [[setting]]
 key = "show_icon"
@@ -46,6 +47,13 @@ type = "bool"
 label_key = "settings.show_dpi.label"
 description_key = "settings.show_dpi.description"
 default = true
+
+[[setting]]
+key = "bar_device"
+type = "string"
+label_key = "settings.bar_device.label"
+description_key = "settings.bar_device.description"
+default = ""
 
 [[setting]]
 key = "interval"
@@ -86,7 +94,7 @@ entry = "bar.luau"
 [[panel]]
 id = "panel"
 entry = "panel.luau"
-width = 780
+width = 1020
 height = 720
 placement = "attached"
 position = "auto"

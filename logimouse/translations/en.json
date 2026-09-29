@@ -27,6 +27,10 @@
     "battery_low": {
       "label": "Battery low level (%)",
       "description": "At or below this percentage the battery is shown in the theme's error colour. If it is at or above the warning level, there is no amber band."
+    },
+    "bar_device": {
+      "label": "Device in the bar",
+      "description": "Which device the bar shows: part of its name (e.g. PRO X) or its unit ID, as the panel lists it. Leave empty to show the first online device with a battery."
     }
   },
   "bar": {
@@ -80,6 +84,22 @@
     "slot": "Slot {n}",
     "slots_used": "{used} of {total} slots",
     "no_data": "No mouse data yet",
-    "waiting": "Waiting for the first reading…"
+    "waiting": "Waiting for the first reading…",
+    "connection": "Connection",
+    "direct": "direct",
+    "usb_product": "USB product",
+    "devices": "Devices",
+    "receivers": "Receivers",
+    "no_access": "no access to {path}",
+    "none_found": "No Logitech devices found",
+    "rate_title": "Report rate",
+    "rate_down": "Lower report rate",
+    "rate_up": "Higher report rate",
+    "mode_onboard": "onboard profile",
+    "mode_host": "host mode",
+    "use_host": "Use host mode",
+    "use_onboard": "Back to onboard profile",
+    "onboard_note": "The mouse's stored profile sets the report rate. Host mode lets you change it here, and turns the profile (its buttons, DPI levels and lighting) off until you switch back.",
+    "host_note": "The onboard profile is off: its buttons, DPI levels and lighting return when you switch back."
   }
 }

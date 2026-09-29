@@ -24,6 +24,7 @@ local function config()
     showBattery = noctalia.getConfig("show_battery") ~= false,
     showCharging = noctalia.getConfig("show_charging") ~= false,
     showDpi = noctalia.getConfig("show_dpi") ~= false,
+    barDevice = noctalia.getConfig("bar_device") or "",
     batteryWarn = noctalia.getConfig("battery_warn"),
     batteryLow = noctalia.getConfig("battery_low"),
   }

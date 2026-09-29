@@ -1,9 +1,9 @@
 # logimouse
 
-Reads everything a Logitech device on a Logi Bolt receiver reports (name, firmware,
-battery, DPI, scroll wheel, Easy-Switch, buttons) and the receiver's own details, by
-talking HID++ directly over `/dev/hidraw`. It can also change the DPI. No runtime
-dependencies.
+Reads everything a Logitech HID++ device reports (name, firmware, battery, DPI, scroll
+wheel, Easy-Switch, buttons), for devices on a Logi Bolt receiver and devices
+connected directly by USB, plus each receiver's own details, by talking HID++ over
+`/dev/hidraw`. It can also change the DPI. No runtime dependencies.
 
 The repository also holds **Logi Mouse**, a [Noctalia](https://noctalia.dev) plugin
 built on it: battery, charging state and DPI in the bar, and a panel with everything
@@ -24,14 +24,31 @@ also registers this directory as the plugin source `logimouse` and enables
 ## Usage
 
 ```sh
-logimouse                    # device and receiver info
-logimouse --json             # the same, as JSON (what the Noctalia plugin reads)
-logimouse dpi                # show the current DPI
-logimouse dpi up             # next supported DPI step
-logimouse dpi down           # previous supported DPI step
-logimouse dpi 1200           # set an exact value
-logimouse --slot 2 dpi up    # pick a device when several are paired
+logimouse                            # every device and receiver
+logimouse --json                     # the same, as JSON (what the Noctalia plugin reads)
+logimouse dpi                        # show the current DPI
+logimouse dpi up                     # next supported DPI step
+logimouse dpi down                   # previous supported DPI step
+logimouse dpi 1200                   # set an exact value
+logimouse --device 829A24C0 dpi up   # pick a device by the unit ID the report shows
+logimouse --slot 2 dpi up            # or by its receiver slot
+logimouse rate                       # report rate and profile mode
+logimouse rate up|down|<Hz>          # change the report rate
+logimouse mode host|onboard          # onboard-profile mode (gaming mice)
 ```
+
+On a mouse with onboard profiles (such as the PRO X Wireless), the stored profile
+sets the report rate and the mouse refuses a change: switch to host mode first.
+Host mode turns the profile (its buttons, DPI levels, lighting) off until you switch
+back with `logimouse mode onboard`.
+
+Runs are serialized with a lock (`$XDG_RUNTIME_DIR/logimouse.lock`): receivers answer
+one request at a time, and concurrent runs would read each other's replies.
+
+Without `--device` or `--slot`, `dpi` and `rate` act on the first device that
+supports them.
+Every Logitech hidraw node that carries HID++ is read; a node the user cannot open
+is listed under "Not accessible" instead of stopping the rest.
 
 `logi` is the same command. With `--json`, errors are printed as
 `{"ok": false, "error": "..."}` with exit code 1.

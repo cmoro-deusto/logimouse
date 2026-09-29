@@ -119,6 +119,66 @@ function M.dpiFraction(dpi)
   return math.max(0, math.min(1, (current - low) / (high - low)))
 end
 
+-- "1000 Hz", or "" when the device does not report its rate.
+function M.reportRateText(rate)
+  if type(rate) ~= "table" or tonumber(rate.current) == nil then
+    return ""
+  end
+  return string.format("%d Hz", tonumber(rate.current))
+end
+
+-- Where the current rate sits among the supported ones, 0..1: the rates are powers
+-- of two apart, so the bar moves by position in the list rather than by Hz.
+function M.rateFraction(rate)
+  if type(rate) ~= "table" or type(rate.supported) ~= "table" or #rate.supported < 2 then
+    return 0
+  end
+  for i, hz in ipairs(rate.supported) do
+    if hz == rate.current then
+      return (i - 1) / (#rate.supported - 1)
+    end
+  end
+  return 0
+end
+
+function M.canRateDown(rate)
+  return type(rate) == "table" and type(rate.supported) == "table" and #rate.supported > 0
+    and tonumber(rate.current) ~= nil and tonumber(rate.current) > rate.supported[1]
+end
+
+function M.canRateUp(rate)
+  return type(rate) == "table" and type(rate.supported) == "table" and #rate.supported > 0
+    and tonumber(rate.current) ~= nil and tonumber(rate.current) < rate.supported[#rate.supported]
+end
+
+-- "125 · 250 · 500 · 1000 Hz"
+function M.ratesText(rate)
+  if type(rate) ~= "table" or type(rate.supported) ~= "table" or #rate.supported == 0 then
+    return ""
+  end
+  local parts = {}
+  for _, hz in ipairs(rate.supported) do
+    parts[#parts + 1] = tostring(hz)
+  end
+  return table.concat(parts, " · ") .. " Hz"
+end
+
+-- Whether the report rate can be changed now: not while the onboard profile sets it.
+function M.rateSettable(info)
+  return type(info) == "table" and type(info.reportRate) == "table" and info.profileMode ~= "onboard"
+end
+
+-- Which of the optional cards a device has anything for: a gaming mouse such as the
+-- PRO X has no SmartShift, no Easy-Switch and keeps its buttons elsewhere.
+function M.sections(info)
+  info = info or {}
+  return {
+    wheel = info.smartShift ~= nil or info.wheel ~= nil,
+    hosts = type(info.hosts) == "table" and #info.hosts > 0,
+    buttons = type(info.buttons) == "table" and #info.buttons > 0,
+  }
+end
+
 function M.canDpiDown(dpi)
   return type(dpi) == "table" and tonumber(dpi.current) ~= nil and tonumber(dpi.min) ~= nil
     and tonumber(dpi.current) > tonumber(dpi.min)
@@ -131,9 +191,77 @@ end
 
 -- ── Devices ─────────────────────────────────────────────────────────────────
 
--- The device the bar reflects: the first online one with a battery, then the first
--- online one, then the first known one. `devices` is the service's list of
--- { slot, online, lastSeen, info }.
+-- A device's identity across reads: its unit ID, which survives a move to another
+-- receiver slot or node, or where it is connected when it has none.
+function M.deviceKey(info)
+  if type(info) ~= "table" then
+    return nil
+  end
+  if info.unitId and info.unitId ~= "" then
+    return info.unitId
+  end
+  local connection = info.connection or {}
+  if connection.type == "receiver" then
+    return tostring(connection.receiver) .. "#" .. tostring(connection.slot)
+  end
+  return tostring(connection.path)
+end
+
+-- "Logi Bolt receiver" -> "Bolt": the short form the device list has room for.
+function M.shortReceiver(name)
+  local short = tostring(name or "receiver"):gsub("^Logi ", ""):gsub(" receiver$", "")
+  return short
+end
+
+-- "Bolt · 2" or "USB".
+function M.connectionShort(info)
+  local connection = info and info.connection or {}
+  if connection.type == "receiver" then
+    return M.shortReceiver(connection.receiverName) .. " · " .. tostring(connection.slot)
+  end
+  if connection.type == "direct" then
+    return "USB"
+  end
+  return ""
+end
+
+-- The number in /dev/hidrawN, so hidraw13 sorts after hidraw6.
+local function nodeNumber(path)
+  return tonumber(tostring(path or ""):match("(%d+)$")) or 0
+end
+
+-- Devices on receivers first, by receiver node and slot, then direct ones by node.
+-- It depends only on where a device is connected, so rows do not move when a
+-- device sleeps or wakes.
+local function sortKey(entry)
+  local connection = entry.info and entry.info.connection or {}
+  if connection.type == "receiver" then
+    return 0, nodeNumber(connection.receiver), tonumber(connection.slot) or 0
+  end
+  return 1, nodeNumber(connection.path), 0
+end
+
+function M.sortDevices(devices)
+  table.sort(devices, function(a, b)
+    local a1, a2, a3 = sortKey(a)
+    local b1, b2, b3 = sortKey(b)
+    if a1 ~= b1 then
+      return a1 < b1
+    end
+    if a2 ~= b2 then
+      return a2 < b2
+    end
+    if a3 ~= b3 then
+      return a3 < b3
+    end
+    return tostring(a.key) < tostring(b.key)
+  end)
+  return devices
+end
+
+-- The device the bar reflects when none is chosen: the first online one with a
+-- battery, then the first online one, then the first known one. `devices` is the
+-- service's list of { key, online, lastSeen, info }.
 function M.primaryDevice(devices)
   if type(devices) ~= "table" then
     return nil
@@ -151,13 +279,45 @@ function M.primaryDevice(devices)
   return devices[1]
 end
 
-function M.findDevice(devices, slot)
+-- The device named by the bar_device setting: part of its name, case-insensitive,
+-- or its unit ID. Empty means primaryDevice. Returns nil when nothing matches.
+function M.barDevice(devices, wanted)
+  wanted = tostring(wanted or ""):match("^%s*(.-)%s*$")
+  if wanted == "" then
+    return M.primaryDevice(devices)
+  end
+  local lower = wanted:lower()
+  for _, entry in ipairs(devices or {}) do
+    local info = entry.info or {}
+    if tostring(info.unitId or ""):lower() == lower then
+      return entry
+    end
+  end
+  for _, entry in ipairs(devices or {}) do
+    local info = entry.info or {}
+    if tostring(info.name or ""):lower():find(lower, 1, true) then
+      return entry
+    end
+  end
+  return nil
+end
+
+function M.findDevice(devices, key)
   if type(devices) ~= "table" then
     return nil
   end
   for _, entry in ipairs(devices) do
-    if entry.slot == slot then
+    if entry.key == key then
       return entry
+    end
+  end
+  return nil
+end
+
+function M.findReceiver(receivers, path)
+  for _, receiver in ipairs(receivers or {}) do
+    if receiver.path == path then
+      return receiver
     end
   end
   return nil
@@ -176,15 +336,18 @@ function M.firmware(info, kind)
   return nil
 end
 
--- "mouse · slot 2 · “MX Anywhere3SB”"
+-- "mouse · Bolt slot 2 · “MX Anywhere3SB”", or "mouse · USB".
 function M.subtitle(entry)
   local info = entry and entry.info or {}
   local parts = {}
   if info.type then
     parts[#parts + 1] = info.type
   end
-  if entry and entry.slot then
-    parts[#parts + 1] = "slot " .. tostring(entry.slot)
+  local connection = info.connection or {}
+  if connection.type == "receiver" then
+    parts[#parts + 1] = M.shortReceiver(connection.receiverName) .. " slot " .. tostring(connection.slot)
+  elseif connection.type == "direct" then
+    parts[#parts + 1] = "USB"
   end
   if info.friendlyName and info.friendlyName ~= "" and info.friendlyName ~= info.name then
     parts[#parts + 1] = "“" .. info.friendlyName .. "”"
@@ -203,10 +366,14 @@ end
 function M.barModel(data, cfg, now)
   local model = { empty = true, icon = "mouse-off", iconColor = M.COLOR_NORMAL, charging = false, dim = false, tooltip = {} }
   data = data or {}
-  local entry = M.primaryDevice(data.devices)
+  local entry = M.barDevice(data.devices, cfg.barDevice)
 
   if entry == nil or entry.info == nil then
     local reason = data.error
+    local wanted = tostring(cfg.barDevice or ""):match("^%s*(.-)%s*$")
+    if (reason == nil or reason == "") and wanted ~= "" and #(data.devices or {}) > 0 then
+      reason = "no device matches “" .. wanted .. "”"
+    end
     if reason == nil or reason == "" then
       reason = "waiting for the first reading"
     end
@@ -254,41 +421,51 @@ end
 
 -- ── Service ─────────────────────────────────────────────────────────────────
 
--- Merge a fresh report into the devices already known. A device the receiver still
--- lists as paired but that did not answer keeps its last values, marked offline;
--- one that is no longer paired is dropped. Returns a new list sorted by slot.
+-- Merge a fresh report into the devices already known. A device on a receiver that
+-- still lists its slot as paired keeps its last values, marked offline, when it does
+-- not answer; a device connected directly is dropped once it is gone, since its node
+-- goes with it. Returns a new list in display order.
 function M.mergeDevices(known, report, now)
-  local bySlot = {}
+  local byKey = {}
   for _, entry in ipairs(known or {}) do
-    bySlot[entry.slot] = { slot = entry.slot, online = false, lastSeen = entry.lastSeen, info = entry.info }
+    byKey[entry.key] = { key = entry.key, online = false, lastSeen = entry.lastSeen, info = entry.info }
   end
+  local fresh = {}
+  local freshSlots = {}
   for _, info in ipairs(report.devices or {}) do
-    bySlot[info.slot] = { slot = info.slot, online = true, lastSeen = now, info = info }
+    local key = M.deviceKey(info)
+    byKey[key] = { key = key, online = true, lastSeen = now, info = info }
+    fresh[key] = true
+    local connection = info.connection or {}
+    if connection.type == "receiver" then
+      freshSlots[tostring(connection.receiver) .. "#" .. tostring(connection.slot)] = true
+    end
   end
   local paired = {}
-  local receiver = report.receiver
-  if type(receiver) == "table" and type(receiver.slots) == "table" then
-    for _, slot in ipairs(receiver.slots) do
-      paired[slot.slot] = true
+  for _, receiver in ipairs(report.receivers or {}) do
+    for _, slot in ipairs(receiver.slots or {}) do
+      paired[tostring(receiver.path) .. "#" .. tostring(slot.slot)] = true
     end
   end
   local out = {}
-  for slot, entry in pairs(bySlot) do
-    if entry.online or paired[slot] then
+  for key, entry in pairs(byKey) do
+    local connection = entry.info and entry.info.connection or {}
+    local slotKey = tostring(connection.receiver) .. "#" .. tostring(connection.slot)
+    -- A remembered device keeps its slot only while nothing else has been read there:
+    -- a fresh device in the same slot replaces it (a re-pairing, or a bad read).
+    local stillPaired = connection.type == "receiver" and paired[slotKey] and not freshSlots[slotKey]
+    if fresh[key] or stillPaired then
       out[#out + 1] = entry
     end
   end
-  table.sort(out, function(a, b)
-    return a.slot < b.slot
-  end)
-  return out
+  return M.sortDevices(out)
 end
 
 -- Every device marked offline, values kept: what a failed read leaves behind.
 function M.markOffline(known)
   local out = {}
   for _, entry in ipairs(known or {}) do
-    out[#out + 1] = { slot = entry.slot, online = false, lastSeen = entry.lastSeen, info = entry.info }
+    out[#out + 1] = { key = entry.key, online = false, lastSeen = entry.lastSeen, info = entry.info }
   end
   return out
 end

@@ -1,11 +1,13 @@
 --!nonstrict
 -- The panel: everything `logimouse` knows about the mouse and the receiver.
 --
--- Layout, top to bottom: a header with the device and the refresh and settings
--- buttons; battery and DPI side by side; the scroll wheel and Easy-Switch; the
--- buttons as chips; and the device's identity next to the receiver's. The only
--- control that changes anything is the DPI's − and +, which the service runs, so
--- that one `logimouse` process talks to the receiver at a time.
+-- Layout: a column on the left lists every device (then the ones that cannot be
+-- opened, then the receivers); the right side describes the selected device, top to
+-- bottom: a header with the refresh and settings buttons; battery and DPI side by
+-- side; the scroll wheel and Easy-Switch; the buttons as chips; and the device's
+-- identity next to how it is connected. The only control that changes anything is
+-- the DPI's − and +, which the service runs, so that one `logimouse` process talks to
+-- the devices at a time.
 
 local shared = require("./shared.luau")
 
@@ -20,9 +22,10 @@ local CHIP_FILL = "on_surface/0.06"
 local CHIP_BORDER = "outline/0.12"
 local CHIPS_PER_ROW = 4
 local CLEAR = "#00000000"
+local SIDEBAR_WIDTH = 236
 
 local isOpen = false
-local selectedSlot = nil
+local selectedKey = nil
 
 local render
 
@@ -113,26 +116,6 @@ local function header(entry, data)
   })
 end
 
-local function tabs(devices)
-  local buttons = {}
-  for _, entry in ipairs(devices) do
-    local slot = entry.slot
-    local function select()
-      selectedSlot = slot
-      render()
-    end
-    buttons[#buttons + 1] = ui.button({
-      key = "tab" .. tostring(slot),
-      text = (entry.info and entry.info.name) or ("Slot " .. tostring(slot)),
-      variant = "ghost",
-      controlSize = "sm",
-      selected = slot == selectedSlot,
-      onClick = select,
-    })
-  end
-  return ui.row({ gap = 6 }, buttons)
-end
-
 local function batteryCard(info)
   local battery = info.battery
   local cfg = config()
@@ -166,13 +149,27 @@ local function batteryCard(info)
   }, { flexGrow = 1 })
 end
 
+-- A click handler that asks the service to run `logimouse <command> <action>` on this device.
+local function requestChange(entry, command, action)
+  return function()
+    noctalia.state.set("change_request", { key = entry.key, unitId = entry.info.unitId, command = command, action = action, id = noctalia.nowMs() })
+  end
+end
+
+-- The failure of the last change on this device, when it was one of these commands.
+local function noticeFor(entry, data, commands)
+  local notice = data.notice
+  if type(notice) ~= "table" or notice.key ~= entry.key or not commands[notice.command] then
+    return nil
+  end
+  return notice.text
+end
+
 local function dpiCard(entry, data)
   local dpi = entry.info.dpi
   local usable = entry.online and data.busy ~= true
   local function change(action)
-    return function()
-      noctalia.state.set("dpi_request", { slot = entry.slot, action = action, id = noctalia.nowMs() })
-    end
+    return requestChange(entry, "dpi", action)
   end
   local defaultText = dpi and dpi.default and tr("panel.dpi_default", { value = tostring(dpi.default) }) or ""
   local children = {
@@ -185,10 +182,49 @@ local function dpiCard(entry, data)
     ui.progress({ progress = shared.dpiFraction(dpi), fill = ACCENT, track = TRACK, height = 8, radius = 4 }),
     ui.label({ text = table.concat({ defaultText, shared.dpiRangeText(dpi) }, " · "), fontSize = 11, color = MUTED, maxLines = 1 }),
   }
-  if data.notice and data.notice ~= "" then
-    children[#children + 1] = ui.label({ text = data.notice, fontSize = 11, color = "error", maxLines = 2 })
+  local notice = noticeFor(entry, data, { dpi = true })
+  if notice then
+    children[#children + 1] = ui.label({ text = notice, fontSize = 11, color = "error", maxLines = 2 })
   elseif not entry.online then
     children[#children + 1] = ui.label({ text = tr("panel.dpi_asleep"), fontSize = 11, color = MUTED, maxLines = 1 })
+  end
+  return card(children, { flexGrow = 1 })
+end
+
+-- The report rate, stepped like the DPI. On a mouse whose onboard profile sets it,
+-- the − and + stay disabled until you switch to host mode here, and the card says
+-- what host mode turns off.
+local function rateCard(entry, data)
+  local info = entry.info
+  local rate = info.reportRate
+  local usable = entry.online and data.busy ~= true
+  local settable = shared.rateSettable(info)
+  local children = {
+    caption(tr("panel.rate_title"), "activity"),
+    ui.row({ gap = 12, align = "center" }, {
+      ui.button({ glyph = "minus", variant = "outline", controlSize = "sm", tooltip = tr("panel.rate_down"), enabled = usable and settable and shared.canRateDown(rate), onClick = requestChange(entry, "rate", "down") }),
+      ui.label({ text = shared.reportRateText(rate), fontSize = 32, fontWeight = "bold", color = "on_surface", textAlign = "center", flexGrow = 1 }),
+      ui.button({ glyph = "plus", variant = "outline", controlSize = "sm", tooltip = tr("panel.rate_up"), enabled = usable and settable and shared.canRateUp(rate), onClick = requestChange(entry, "rate", "up") }),
+    }),
+    ui.progress({ progress = shared.rateFraction(rate), fill = ACCENT, track = TRACK, height = 8, radius = 4 }),
+    ui.label({ text = shared.ratesText(rate), fontSize = 11, color = MUTED, maxLines = 1 }),
+  }
+  if info.profileMode == "onboard" or info.profileMode == "host" then
+    local onboard = info.profileMode == "onboard"
+    children[#children + 1] = ui.row({ gap = 8, align = "center" }, {
+      chip(onboard and tr("panel.mode_onboard") or tr("panel.mode_host"), onboard and nil or { fill = "primary/0.14", border = "primary/0.40" }),
+      ui.spacer({ flexGrow = 1 }),
+      ui.button({
+        text = onboard and tr("panel.use_host") or tr("panel.use_onboard"),
+        variant = "outline", controlSize = "sm", enabled = usable,
+        onClick = requestChange(entry, "mode", onboard and "host" or "onboard"),
+      }),
+    })
+    children[#children + 1] = ui.label({ text = onboard and tr("panel.onboard_note") or tr("panel.host_note"), fontSize = 11, color = MUTED, maxLines = 3 })
+  end
+  local notice = noticeFor(entry, data, { rate = true, mode = true })
+  if notice then
+    children[#children + 1] = ui.label({ text = notice, fontSize = 11, color = "error", maxLines = 2 })
   end
   return card(children, { flexGrow = 1 })
 end
@@ -279,10 +315,7 @@ local function deviceCard(info)
   return card(rows, { flexGrow = 1 })
 end
 
-local function receiverCard(receiver)
-  if type(receiver) ~= "table" then
-    return card({ caption(tr("panel.receiver"), "usb"), ui.label({ text = tr("panel.no_receiver"), fontSize = 12, color = MUTED }) }, { flexGrow = 1 })
-  end
+local function slotDots(receiver)
   local occupied = {}
   for _, slot in ipairs(receiver.slots or {}) do
     occupied[slot.slot] = slot
@@ -303,18 +336,117 @@ local function receiverCard(receiver)
     text = tr("panel.slots_used", { used = tostring(receiver.pairedCount or #(receiver.slots or {})), total = tostring(receiver.maxSlots or 6) }),
     fontSize = 11, color = MUTED,
   })
+  return ui.row({ gap = 6, align = "center", paddingV = 4 }, dots)
+end
+
+-- How the selected device is connected: its receiver, with the six pairing slots, or
+-- the USB device it is.
+local function connectionCard(info, data)
+  local connection = info.connection or {}
+  if connection.type == "direct" then
+    return card({
+      caption(tr("panel.connection") .. " · " .. tr("panel.direct"), "usb"),
+      keyValue(tr("panel.usb_product"), connection.product),
+      keyValue(tr("panel.usb_id"), connection.usbId),
+      keyValue(tr("panel.node"), connection.path),
+    }, { flexGrow = 1 })
+  end
+  local receiver = shared.findReceiver(data.receivers, connection.receiver)
+  if receiver == nil then
+    return card({ caption(tr("panel.connection"), "usb"), ui.label({ text = tr("panel.no_receiver"), fontSize = 12, color = MUTED }) }, { flexGrow = 1 })
+  end
   local rows = {
-    caption(tr("panel.receiver") .. " · Logi Bolt", "usb"),
+    caption(tr("panel.connection") .. " · " .. tostring(receiver.name), "usb"),
     keyValue(tr("panel.usb_id"), receiver.usbId),
     keyValue(tr("panel.release"), receiver.release),
     keyValue(tr("panel.unique_id"), receiver.uniqueId),
     keyValue(tr("panel.node"), receiver.path),
-    ui.row({ gap = 6, align = "center", paddingV = 4 }, dots),
+    slotDots(receiver),
   }
   for _, slot in ipairs(receiver.slots or {}) do
     rows[#rows + 1] = keyValue(tr("panel.slot", { n = tostring(slot.slot) }), string.format("%s · %s · WPID %s", slot.name or "?", slot.kind or "?", slot.wpid or "?"), "pairing" .. tostring(slot.slot))
   end
   return card(rows, { flexGrow = 1 })
+end
+
+-- ── Device list ─────────────────────────────────────────────────────────────
+
+local function sectionTitle(text)
+  return ui.label({ text = string.upper(text), fontSize = 10, fontWeight = "semibold", color = MUTED })
+end
+
+local function deviceRow(entry, selected)
+  local info = entry.info or {}
+  local cfg = config()
+  local level = shared.batteryLevel(info.battery, cfg.batteryWarn, cfg.batteryLow)
+  local key = entry.key
+  local function pick()
+    selectedKey = key
+    render()
+  end
+  local status = {
+    dot(8, entry.online and ACCENT or CLEAR, entry.online and ACCENT or "outline/0.6"),
+  }
+  if info.battery then
+    status[#status + 1] = ui.label({ text = shared.percentText(info.battery), fontSize = 11, fontWeight = "semibold", color = shared.levelColor(level) })
+  end
+  if level == "charging" then
+    status[#status + 1] = ui.glyph({ name = "bolt", size = 11, color = ACCENT })
+  end
+  status[#status + 1] = ui.label({ text = shared.connectionShort(info), fontSize = 11, color = MUTED, maxLines = 1 })
+  return ui.row({
+    key = "device" .. tostring(key), gap = 10, align = "center", padding = 8, radius = 10,
+    fill = selected and "primary/0.10" or CLEAR, border = selected and "primary/0.45" or CLEAR, borderWidth = 1,
+    onClick = pick,
+  }, {
+    ui.box({ width = 3, height = 34, radius = 2, fill = selected and ACCENT or CLEAR }),
+    ui.column({ gap = 3, flexGrow = 1 }, {
+      ui.label({ text = info.name or tr("panel.unknown_device"), fontSize = 12, fontWeight = "semibold", color = "on_surface", maxLines = 1 }),
+      ui.row({ gap = 5, align = "center" }, status),
+    }),
+  })
+end
+
+local function lockedRow(node)
+  return ui.row({ key = "locked" .. tostring(node.path), gap = 10, align = "center", padding = 8, opacity = 0.75 }, {
+    ui.glyph({ name = "lock", size = 14, color = MUTED }),
+    ui.column({ gap = 3, flexGrow = 1 }, {
+      ui.label({ text = node.name or tr("panel.unknown_device"), fontSize = 12, fontWeight = "semibold", color = "on_surface", maxLines = 1 }),
+      ui.label({ text = tr("panel.no_access", { path = tostring(node.path) }), fontSize = 11, color = MUTED, maxLines = 1 }),
+    }),
+  })
+end
+
+local function receiverRow(receiver)
+  local used = receiver.pairedCount or #(receiver.slots or {})
+  return ui.row({ key = "receiver" .. tostring(receiver.path), gap = 10, align = "center", padding = 8 }, {
+    ui.glyph({ name = "usb", size = 14, color = MUTED }),
+    ui.column({ gap = 3, flexGrow = 1 }, {
+      ui.label({ text = receiver.name or tr("panel.receiver"), fontSize = 12, color = "on_surface", maxLines = 1 }),
+      ui.label({ text = tr("panel.slots_used", { used = tostring(used), total = tostring(receiver.maxSlots or 6) }), fontSize = 11, color = MUTED, maxLines = 1 }),
+    }),
+  })
+end
+
+local function sidebar(data, selected)
+  local rows = { sectionTitle(tr("panel.devices")) }
+  for _, entry in ipairs(data.devices or {}) do
+    rows[#rows + 1] = deviceRow(entry, selected ~= nil and entry.key == selected.key)
+  end
+  for _, node in ipairs(data.inaccessible or {}) do
+    rows[#rows + 1] = lockedRow(node)
+  end
+  if #rows == 1 then
+    rows[#rows + 1] = ui.label({ text = tr("panel.none_found"), fontSize = 11, color = MUTED })
+  end
+  if #(data.receivers or {}) > 0 then
+    rows[#rows + 1] = ui.spacer({ height = 8 })
+    rows[#rows + 1] = sectionTitle(tr("panel.receivers"))
+    for _, receiver in ipairs(data.receivers) do
+      rows[#rows + 1] = receiverRow(receiver)
+    end
+  end
+  return ui.scroll({ width = SIDEBAR_WIDTH, gap = 4, padding = 12, radius = 14, fill = "surface_variant/0.20" }, rows)
 end
 
 -- ── Render ──────────────────────────────────────────────────────────────────
@@ -340,34 +472,52 @@ render = function()
   end
   local data = noctalia.state.get("data") or {}
   local devices = data.devices or {}
-  local entry = selectedSlot and shared.findDevice(devices, selectedSlot) or nil
+  local entry = selectedKey and shared.findDevice(devices, selectedKey) or nil
   if entry == nil then
     entry = shared.primaryDevice(devices)
-    selectedSlot = entry and entry.slot or nil
-  end
-  if entry == nil or entry.info == nil then
-    panel.render(ui.column({ padding = 16, flexGrow = 1 }, { emptyView(data) }))
-    return
+    selectedKey = entry and entry.key or nil
   end
 
-  local info = entry.info
   local body = {}
-  if #devices > 1 then
-    body[#body + 1] = tabs(devices)
-  end
-  body[#body + 1] = header(entry, data)
+  -- Only errors that stop everything get the banner; a device that cannot be
+  -- opened is its own row in the list.
   if data.error and data.error ~= "" then
     body[#body + 1] = ui.row({ gap = 8, align = "center", padding = 10, radius = 10, fill = "error/0.12" }, {
       ui.glyph({ name = "alert-triangle", size = 14, color = "error" }),
       ui.label({ text = data.error, fontSize = 12, color = "on_surface", flexGrow = 1, maxLines = 2 }),
     })
   end
-  body[#body + 1] = ui.row({ gap = 12 }, { batteryCard(info), dpiCard(entry, data) })
-  body[#body + 1] = ui.row({ gap = 12 }, { wheelCard(info), hostsCard(info) })
-  body[#body + 1] = buttonsCard(info)
-  body[#body + 1] = ui.row({ gap = 12 }, { deviceCard(info), receiverCard(data.receiver) })
+  if entry == nil or entry.info == nil then
+    body[#body + 1] = emptyView(data)
+  else
+    local info = entry.info
+    table.insert(body, 1, header(entry, data))
+    body[#body + 1] = ui.row({ gap = 12 }, { batteryCard(info), dpiCard(entry, data) })
+    -- Cards for features the device does not have are left out, not shown empty.
+    local sections = shared.sections(info)
+    local middle = {}
+    if info.reportRate then
+      middle[#middle + 1] = rateCard(entry, data)
+    end
+    if sections.wheel then
+      middle[#middle + 1] = wheelCard(info)
+    end
+    if sections.hosts then
+      middle[#middle + 1] = hostsCard(info)
+    end
+    if #middle > 0 then
+      body[#body + 1] = ui.row({ gap = 12 }, middle)
+    end
+    if sections.buttons then
+      body[#body + 1] = buttonsCard(info)
+    end
+    body[#body + 1] = ui.row({ gap = 12 }, { deviceCard(info), connectionCard(info, data) })
+  end
 
-  panel.render(ui.scroll({ padding = 16, gap = 12, flexGrow = 1 }, body))
+  panel.render(ui.row({ gap = 12, padding = 16, flexGrow = 1 }, {
+    sidebar(data, entry),
+    ui.scroll({ gap = 12, flexGrow = 1 }, body),
+  }))
 end
 
 noctalia.state.watch("data", function()

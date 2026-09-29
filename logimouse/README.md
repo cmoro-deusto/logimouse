@@ -1,8 +1,9 @@
 # Logi Mouse
 
-The battery level, charging state and DPI of a Logitech mouse on a Logi Bolt
-receiver, in the Noctalia bar. Clicking the widget opens a panel with everything
-the mouse and the receiver report, and lets you step the DPI up or down.
+The battery level, charging state and DPI of a Logitech mouse, on a Logi Bolt
+receiver or connected directly by USB, in the Noctalia bar. Clicking the widget
+opens a panel that lists every device and shows everything the selected one and its
+receiver report, and lets you step the DPI up or down.
 
 ## Plugin
 
@@ -17,15 +18,17 @@ the mouse and the receiver report, and lets you step the DPI up or down.
 same repository as this plugin, and `install.sh` there installs both. The plugin
 cannot read the mouse itself: Noctalia's scripts cannot open `/dev/hidraw*`.
 
-The user running Noctalia needs read/write access to the receiver's hidraw node.
-Desktop sessions grant this through a uaccess ACL, so there is usually nothing to
-do. Tested with an MX Anywhere 3S for Business; other HID++ 2.0 devices on a Bolt
-receiver should work, showing whatever features they have.
+The user running Noctalia needs read/write access to each device's hidraw node.
+`grant-access.sh` in the same repository adds a udev rule for the devices you pick.
+A device without access is listed in the panel with a lock and the node it needs.
+Tested with an MX Anywhere 3S for Business on a Bolt receiver; other HID++ 2.0
+devices should work, showing whatever features they have.
 
 ## Usage
 
-Add **Logi Mouse** from the bar's widget picker (Settings → Bar). It shows, each
-one optional:
+Add **Logi Mouse** from the bar's widget picker (Settings → Bar). It shows one
+device, the one `bar_device` names or the first online one with a battery, with,
+each one optional:
 
 - a mouse icon, which turns into a warning sign when the battery is low;
 - the battery percentage, amber at or below the warning level and in the theme's
@@ -41,11 +44,17 @@ dash and the tooltip gives the reason.
 - **Right click** opens the settings.
 - **Hover** shows the device, battery, DPI and any error.
 
-The panel shows battery and DPI, the scroll wheel (SmartShift and resolution),
-the Easy-Switch channels, the buttons, the device's model, serial and firmware,
-and the receiver with its six pairing slots. The DPI's − and + buttons move one
-supported step; they are disabled while the mouse is asleep. Open the panel from
-anywhere, including a compositor key binding:
+The panel's left column lists every device (online or asleep, battery, and how it
+is connected), then the devices that cannot be opened, then the receivers. Pick a
+device to see its battery and DPI, the scroll wheel (SmartShift and resolution),
+the Easy-Switch channels, the buttons, its model, unit ID, serial and firmware, and
+its connection: the receiver with its pairing slots, or the USB device. The DPI's
+− and + buttons move one supported step; they are disabled while the mouse is
+asleep. A mouse with a report rate gets a Report rate card that works the same way.
+On a mouse with onboard profiles, its − and + stay disabled while the stored profile
+sets the rate; the card's **Use host mode** button hands the rate to the computer
+(and turns the profile's buttons, DPI levels and lighting off), and **Back to
+onboard profile** restores it. Open the panel from anywhere, including a compositor key binding:
 
 ```sh
 noctalia msg panel-toggle cmoro-deusto/logimouse:panel
@@ -59,6 +68,7 @@ noctalia msg panel-toggle cmoro-deusto/logimouse:panel
 | `show_battery` | `bool` | `true` | Show the battery percentage. |
 | `show_charging` | `bool` | `true` | Show a bolt while charging, independently of `show_battery`. |
 | `show_dpi` | `bool` | `true` | Show the current DPI. |
+| `bar_device` | `string` | empty | Which device the bar shows: part of its name (`PRO X`) or its unit ID from the panel. Empty picks the first online device with a battery. |
 | `interval` | `int` | `60` | Seconds between reads, 10–600. |
 | `battery_warn` | `int` | `20` | Percentage at or below which the battery is amber, 10–80. |
 | `battery_low` | `int` | `10` | Percentage at or below which the battery is in the error colour, 5–50. If it is at or above `battery_warn`, there is no amber band. |
@@ -69,8 +79,10 @@ While the mouse is charging, neither colour applies.
 
 - **Processes spawned.** The service runs `logimouse --json` once per `interval`,
   when the panel opens, and when you press the panel's refresh button. The DPI
-  buttons run `logimouse --json --slot <n> dpi up|down`. Only one runs at a time,
-  because two processes on the same hidraw node would read each other's replies.
+  and report-rate buttons run `logimouse --json --device <unit ID> dpi|rate up|down`,
+  and the mode button `logimouse --json --device <unit ID> mode host|onboard`. Only
+  one runs at a time, because two processes on the same hidraw node would read each
+  other's replies. Only failed reads are logged, prefixed `logimouse:`.
 - **Hardware traffic.** Each read sends about 60 small HID++ requests over the
   wireless link, which is why the interval defaults to a minute.
 - **DPI changes do not persist.** The mouse keeps the DPI in working memory, so it

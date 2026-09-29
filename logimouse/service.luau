@@ -3,12 +3,13 @@
 --
 -- It runs `logimouse --json` once per interval and publishes the result on the
 -- plugin's shared state under "data". The bar widget and the panel only read that.
--- It also runs the panel's DPI changes, published under "dpi_request", so that only
+-- It also runs the panel's changes (DPI, report rate, profile mode), published under
+-- "change_request", so that only
 -- one `logimouse` process talks to the receiver at a time: two processes reading
 -- the same hidraw node would each see the other's replies.
 --
--- Devices that stop answering (a mouse asleep or switched off) keep their last
--- values, marked offline, for as long as the receiver still lists them as paired.
+-- Devices on a receiver that stop answering (a mouse asleep or switched off) keep
+-- their last values, marked offline, for as long as the receiver lists them as paired.
 -- Nothing is written to disk, so after a restart the widget shows a dash until the
 -- first reading.
 
@@ -16,29 +17,33 @@ local shared = require("./shared.luau")
 
 local DATA_KEY = "data"
 local REFRESH_KEY = "refresh"
-local DPI_KEY = "dpi_request"
+local CHANGE_KEY = "change_request"
+-- The commands a change request may run: `logimouse <command> <action>`.
+local COMMANDS = { dpi = true, rate = true, mode = true }
 
 local TIMEOUT_MS = 20000
 local FALLBACK_PATH = "~/.local/bin/logimouse"
 
 local state = {
   devices = {},
-  receiver = nil,
+  receivers = {},
+  inaccessible = {},
   error = "",
-  notice = "",
+  notice = nil,
   fetchedAt = nil,
   busy = false,
 }
 
 local running = false
 local refreshQueued = false
-local dpiQueued = nil
+local changeQueued = nil
 
 local function publish()
   -- A new table every time, so the host sees a change and notifies the watchers.
   noctalia.state.set(DATA_KEY, {
     devices = state.devices,
-    receiver = state.receiver,
+    receivers = state.receivers,
+    inaccessible = state.inaccessible,
     error = state.error,
     notice = state.notice,
     fetchedAt = state.fetchedAt,
@@ -118,49 +123,49 @@ local function read()
     else
       state.error = ""
       state.devices = shared.mergeDevices(state.devices, report, os.time())
-      state.receiver = report.receiver
+      state.receivers = report.receivers or {}
+      state.inaccessible = report.inaccessible or {}
       state.fetchedAt = os.time()
     end
     publish()
   end)
 end
 
-local function changeDpi(request)
+local function change(request)
   local cmd = command()
   if cmd == nil then
-    state.notice = "logimouse not found on PATH"
+    state.notice = { key = request.key, command = request.command, text = "logimouse not found on PATH" }
     publish()
     return
   end
+  -- A device is addressed by its unit ID, which works for one on a receiver and one
+  -- connected directly alike.
   local argv = { cmd, "--json" }
-  if tonumber(request.slot) then
-    argv[#argv + 1] = "--slot"
-    argv[#argv + 1] = tostring(math.floor(tonumber(request.slot)))
+  if type(request.unitId) == "string" and request.unitId ~= "" then
+    argv[#argv + 1] = "--device"
+    argv[#argv + 1] = request.unitId
   end
-  argv[#argv + 1] = "dpi"
+  argv[#argv + 1] = request.command
   argv[#argv + 1] = tostring(request.action)
-  local startedMs = noctalia.nowMs()
   run(argv, function(result)
     local _, reason = decode(result)
-    noctalia.log(string.format("logimouse: ran [%s] in %d ms: exit %s, stdout %s, stderr %s",
-      table.concat(argv, " "), noctalia.nowMs() - startedMs, tostring(result.exitCode),
-      noctalia.string.trim(result.stdout or ""), noctalia.string.trim(result.stderr or "")))
-    state.notice = reason or ""
+    -- The failure belongs to the device it was for, so the panel shows it only there.
+    state.notice = reason and { key = request.key, command = request.command, text = reason } or nil
     -- Read everything again, so the new value shows as the mouse reports it.
     refreshQueued = true
     publish()
   end)
 end
 
--- One job at a time: a queued DPI change first, then a queued read.
+-- One job at a time: a queued change first, then a queued read.
 nextJob = function()
   if running then
     return
   end
-  if dpiQueued ~= nil then
-    local request = dpiQueued
-    dpiQueued = nil
-    changeDpi(request)
+  if changeQueued ~= nil then
+    local request = changeQueued
+    changeQueued = nil
+    change(request)
   elseif refreshQueued then
     refreshQueued = false
     read()
@@ -176,11 +181,11 @@ noctalia.state.watch(REFRESH_KEY, function()
   requestRead()
 end)
 
-noctalia.state.watch(DPI_KEY, function(request)
-  if type(request) ~= "table" or request.action == nil then
+noctalia.state.watch(CHANGE_KEY, function(request)
+  if type(request) ~= "table" or request.action == nil or not COMMANDS[request.command] then
     return
   end
-  dpiQueued = request
+  changeQueued = request
   nextJob()
 end)
 
